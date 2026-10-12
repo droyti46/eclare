@@ -83,6 +83,20 @@
 
 # Стиль кода
 
+Каждый Python-модуль (`.py`), включая `__init__.py` и тесты, должен начинаться
+с единообразной шапки — docstring модуля. При создании нового модуля обязательно
+добавляй эту шапку; при редактировании существующего сохраняй её:
+
+```python
+"""
+Eclare — Evolutionary Contrastive Learning for Alignment of Regulatory Elements.
+
+Evaluation utilities for cross-species regulatory element alignment.
+
+Copyright (c) 2026 Eclare contributors.
+"""
+```
+
 Код должен быть:
 
 - коротким;
