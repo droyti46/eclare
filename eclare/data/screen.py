@@ -167,7 +167,10 @@ def fetch_ccres(
                         }}, timeout=timeout,
                     )
                     response.raise_for_status()
-                except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as error:
+                except (
+                    requests.ConnectionError, requests.Timeout, requests.HTTPError,
+                    requests.exceptions.ChunkedEncodingError,
+                ) as error:
                     if isinstance(error, requests.HTTPError):
                         status = response.status_code
                         if status in {401, 403}:

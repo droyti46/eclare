@@ -118,6 +118,47 @@ def test_failures_not_cached_or_retried(tmp_path, monkeypatch, reply, exception)
     assert not list(tmp_path.rglob("*.json"))
 
 
+def test_chunked_response_retried_then_checkpointed(tmp_path, monkeypatch):
+    expected = [record("EH38E1")]
+    post = Mock(side_effect=[
+        requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead"),
+        response(expected),
+    ])
+    monkeypatch.setattr(requests.Session, "post", post)
+    sleep = Mock()
+    monkeypatch.setattr("eclare.data.screen.time.sleep", sleep)
+    options = dict(cache_dir=tmp_path, retries=1, backoff=2, progress=False)
+
+    assert fetch_ccres(["EH38E1"], "grch38", **options) == expected
+    assert post.call_count == 2
+    assert post.call_args_list[0] == post.call_args_list[1]
+    sleep.assert_called_once_with(2)
+    assert len(list(tmp_path.rglob("*.json"))) == 1
+    post.reset_mock()
+    assert fetch_ccres(["EH38E1"], "grch38", **options) == expected
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize("retries", [0, 2])
+def test_chunked_response_exhausts_retries_without_checkpoint(tmp_path, monkeypatch, retries):
+    error = requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead")
+    post = Mock(side_effect=error)
+    monkeypatch.setattr(requests.Session, "post", post)
+    sleep = Mock()
+    monkeypatch.setattr("eclare.data.screen.time.sleep", sleep)
+
+    with pytest.raises(requests.exceptions.ChunkedEncodingError) as caught:
+        fetch_ccres(
+            ["EH38E1"], "grch38", cache_dir=tmp_path,
+            retries=retries, backoff=2, progress=False,
+        )
+    assert caught.value is error
+    assert post.call_count == retries + 1
+    assert [call.args[0] for call in sleep.call_args_list] == [2 * 2 ** i for i in range(retries)]
+    assert not list(tmp_path.rglob("*.json"))
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
 def test_retry_after_and_exponential_backoff(tmp_path, monkeypatch):
     limited = response(status=429)
     limited.headers["Retry-After"] = "5"
