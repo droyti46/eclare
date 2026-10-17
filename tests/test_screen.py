@@ -6,8 +6,11 @@ Evaluation utilities for cross-species regulatory element alignment.
 Copyright (c) 2026 Eclare contributors.
 """
 
+import hashlib
 import json
 from unittest.mock import Mock
+
+import eclare.data.screen as screen
 
 import pandas as pd
 import pytest
@@ -94,6 +97,7 @@ def test_resume_after_failure_and_retry(tmp_path, monkeypatch):
     assert post.call_count == 2
     assert all(call.kwargs["json"]["variables"]["accessions"] == ["EH38E2"] for call in post.call_args_list)
     sleep.assert_called_once_with(1.0)
+    assert all(call.kwargs["timeout"] == 60 for call in post.call_args_list)
     post.reset_mock()
     fetch_ccres(["EH38E2", "EH38E1"], "grch38", **options)
     post.assert_not_called()
@@ -112,6 +116,22 @@ def test_failures_not_cached_or_retried(tmp_path, monkeypatch, reply, exception)
         fetch_ccres(["EH38E1"], "grch38", cache_dir=tmp_path, progress=False)
     assert post.call_count == 1
     assert not list(tmp_path.rglob("*.json"))
+
+
+def test_retry_after_and_exponential_backoff(tmp_path, monkeypatch):
+    limited = response(status=429)
+    limited.headers["Retry-After"] = "5"
+    post = Mock(side_effect=[limited, response(status=503), response([record("EH38E1")])])
+    monkeypatch.setattr(requests.Session, "post", post)
+    sleep = Mock()
+    monkeypatch.setattr("eclare.data.screen.time.sleep", sleep)
+    rows = fetch_ccres(
+        ["EH38E1"], "grch38", retries=2, backoff=2, timeout=12,
+        fields=["assay"], cache_dir=tmp_path, progress=False,
+    )
+    assert len(rows) == 1
+    assert [call.args[0] for call in sleep.call_args_list] == [5, 4]
+    assert all(call.kwargs["timeout"] == 12 for call in post.call_args_list)
 
 
 def test_pipeline_and_parquet(inputs, tmp_path, monkeypatch):
@@ -143,6 +163,270 @@ def test_pipeline_and_parquet(inputs, tmp_path, monkeypatch):
     calls.clear()
     fetch_human_mouse_metadata(*inputs, batch_size=2, cache_dir=tmp_path / "cache", progress=False)
     assert calls == []
+
+
+def test_selected_fields_and_real_nulls():
+    meta = parse_zscores(
+        [record("EH38E1"), record("EH38E2", [])],
+        fields=["tissue", "assay", "zscore", "tissue"],
+    )
+    assert list(meta.columns) == ["ccre_id", "tissue", "assay", "zscore"]
+    assert meta.values.tolist() == [["EH38E1", "liver", "H3K27ac", 2.5]]
+    assert "EH38E2" in meta.attrs["screen"]["coverage"]["tissue"]
+    with pytest.raises(ValueError, match="fields"):
+        parse_zscores([], fields=["unknown"])
+
+
+@pytest.mark.parametrize("with_tf", [False, True])
+def test_compact_response_keeps_zscore_at_index_eight(with_tf):
+    score = ["ENCSR1", "ENCFF1", "DNase", "liver_ENCDO1", None, None, None, None, -2.5]
+    if with_tf:
+        score.append("na")
+    meta = parse_zscores([record("EH38E1", [score])], fields=["assay", "zscore", "tf"])
+    assert list(meta.columns) == ["ccre_id", "assay", "zscore", "tf"]
+    assert meta.iloc[0, :3].tolist() == ["EH38E1", "DNase", -2.5]
+    assert meta.iloc[0]["tf"] == ("na" if with_tf else None)
+
+
+def test_detail_flag_and_cache_upgrade(tmp_path, monkeypatch):
+    post = Mock(return_value=response([record("EH38E1")]))
+    monkeypatch.setattr(requests.Session, "post", post)
+    options = dict(cache_dir=tmp_path, progress=False)
+    fetch_ccres(["EH38E1"], "grch38", fields=["assay"], **options)
+    assert "include_biosample_details: false" in post.call_args.kwargs["json"]["query"]
+    fetch_ccres(["EH38E1"], "grch38", fields=["tissue"], **options)
+    assert post.call_count == 2
+    assert "include_biosample_details: true" in post.call_args.kwargs["json"]["query"]
+    fetch_ccres(["EH38E1"], "grch38", fields=["zscore"], **options)
+    assert post.call_count == 2
+
+
+def test_legacy_batch_reused_for_subset_and_new_ids(tmp_path, monkeypatch):
+    # Old checkpoints contain raw lists; their hash encodes endpoint/query/IDs.
+    batch = ["EH38E1", "EH38E2"]
+    fingerprint = json.dumps([screen.SCREEN_ENDPOINT, screen.QUERY, "grch38", batch]).encode()
+    folder = tmp_path / "grch38"
+    folder.mkdir()
+    (folder / (hashlib.sha256(fingerprint).hexdigest() + ".json")).write_text(
+        json.dumps([record(id_) for id_ in batch]), encoding="utf-8",
+    )
+    post = Mock(return_value=response([record("EH38E3")]))
+    monkeypatch.setattr(requests.Session, "post", post)
+    rows = fetch_ccres(
+        ["EH38E2", "EH38E3"], "grch38", fields=["tissue"],
+        batch_size=1, cache_dir=tmp_path, progress=False,
+    )
+    assert [row["accession"] for row in rows] == ["EH38E2", "EH38E3"]
+    assert post.call_args.kwargs["json"]["variables"]["accessions"] == ["EH38E3"]
+    assert post.call_count == 1
+
+
+def test_enrich_parquet_preserves_rows_nulls_and_empty_ccres(tmp_path, monkeypatch):
+    score = record("EH38E1")["zscores"][0]
+    other = ["ENCSR2", "ENCFF2", "DNase", "brain_ENCDO2", "Brain",
+             None, "tissue", "embryonic", "1.2", "na"]
+    records = [record("EH38E1", [score, other]), record("EH38E2", [])]
+    post = Mock(return_value=response(records))
+    monkeypatch.setattr(requests.Session, "post", post)
+    options = dict(cache_dir=None, progress=False)
+    meta = screen.fetch_ccre_metadata(
+        ["EH38E1", "EH38E2"], "grch38", fields=["tissue", "assay", "zscore"], **options,
+    )
+    path = tmp_path / "meta.parquet"
+    meta.to_parquet(path, index=False)
+    meta = pd.read_parquet(path)
+    original = meta.copy(deep=True)
+    post.reset_mock()
+    same = screen.enrich_ccre_metadata(
+        meta, ["EH38E1", "EH38E2"], "grch38", fields=["tissue", "zscore"], **options,
+    )
+    pd.testing.assert_frame_equal(same, original)
+    post.assert_not_called()
+    # The API may return the same measurements in a different order.
+    post.return_value = response([record("EH38E1", [other, score]), records[1]])
+    enriched = screen.enrich_ccre_metadata(
+        meta, ["EH38E1", "EH38E2"], "grch38",
+        fields=["tissue", "sample_type", "life_stage", "assay", "zscore"], **options,
+    )
+    pd.testing.assert_frame_equal(enriched[original.columns], original)
+    assert enriched["life_stage"].tolist() == ["adult", "embryonic"]
+    assert post.call_count == 1
+    pd.testing.assert_frame_equal(meta, original)
+    enriched.to_parquet(path, index=False)
+    post.reset_mock()
+    screen.enrich_ccre_metadata(
+        pd.read_parquet(path), ["EH38E1", "EH38E2"], "grch38",
+        fields=["sample_type", "life_stage"], **options,
+    )
+    post.assert_not_called()
+
+
+def test_enrich_new_ids_tracks_partial_field_coverage(tmp_path, monkeypatch):
+    def post(self, endpoint, **kwargs):
+        return response([record(id_) for id_ in kwargs["json"]["variables"]["accessions"]])
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    options = dict(cache_dir=None, progress=False)
+    meta = screen.fetch_ccre_metadata(
+        ["EH38E1"], "grch38", fields=["tissue", "life_stage"], **options,
+    )
+    meta = screen.enrich_ccre_metadata(
+        meta, ["EH38E1", "EH38E2"], "grch38", fields=["tissue"], **options,
+    )
+    assert meta["ccre_id"].tolist() == ["EH38E1", "EH38E2"]
+    assert pd.isna(meta.loc[1, "life_stage"])
+    spy = Mock(return_value=response([record("EH38E2")]))
+    monkeypatch.setattr(requests.Session, "post", spy)
+    meta = screen.enrich_ccre_metadata(
+        meta, ["EH38E1", "EH38E2"], "grch38", fields=["life_stage"], **options,
+    )
+    assert meta["life_stage"].tolist() == ["adult", "adult"]
+    assert spy.call_args.kwargs["json"]["variables"]["accessions"] == ["EH38E2"]
+
+
+def test_selected_fields_e2e(inputs, tmp_path, monkeypatch):
+    def post(self, endpoint, **kwargs):
+        assert "include_biosample_details: true" in kwargs["json"]["query"]
+        return response([record(id_) for id_ in kwargs["json"]["variables"]["accessions"]])
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    pairs, human, mouse = fetch_human_mouse_metadata(
+        *inputs, fields=["tissue", "sample_type", "life_stage", "assay", "zscore"],
+        batch_size=200, cache_dir=tmp_path / "cache", progress=False,
+    )
+    assert len(pairs) == 4
+    for frame in [human, mouse]:
+        assert list(frame.columns) == ["ccre_id", "tissue", "sample_type", "life_stage", "assay", "zscore"]
+    spy = Mock()
+    monkeypatch.setattr(requests.Session, "post", spy)
+    enriched = screen.enrich_ccre_metadata(
+        human, pairs["human_id"].unique(), "grch38",
+        fields=["tissue", "display_name"], cache_dir=tmp_path / "cache", progress=False,
+    )
+    assert enriched["display_name"].tolist() == ["Liver"] * 3
+    spy.assert_not_called()
+
+
+def test_enrich_external_frame_uses_visible_measurement_keys(monkeypatch):
+    first = record("EH38E1")["zscores"][0]
+    second = ["ENCSR2", "ENCFF2", "DNase", "brain_ENCDO2", "Brain",
+              "brain", "tissue", "embryonic", "1.2", "na"]
+    meta = parse_zscores([record("EH38E1", [first, second])])
+    meta = meta.drop(columns=["life_stage"])
+    meta.attrs = {}
+    monkeypatch.setattr(requests.Session, "post", Mock(return_value=response([
+        record("EH38E1", [second, first]),
+    ])))
+    enriched = screen.enrich_ccre_metadata(
+        meta, ["EH38E1"], "grch38", fields=["life_stage"], cache_dir=None, progress=False,
+    )
+    assert enriched["life_stage"].tolist() == ["adult", "embryonic"]
+    pd.testing.assert_frame_equal(enriched[meta.columns], meta)
+
+
+def test_enrich_rejects_ambiguous_external_rows_and_changed_measurements(monkeypatch):
+    score = record("EH38E1")["zscores"][0]
+    second = ["ENCSR2", "ENCFF2", "DNase", "brain_ENCDO2", "Brain",
+              "brain", "tissue", "embryonic", "1.2", "na"]
+    meta = parse_zscores([record("EH38E1", [score, second])], fields=["tissue"])
+    post = Mock(return_value=response([record("EH38E1", [second, score])]))
+    monkeypatch.setattr(requests.Session, "post", post)
+    external = meta.copy()
+    external.attrs = {}
+    with pytest.raises(ValueError, match="Ambiguous"):
+        screen.enrich_ccre_metadata(
+            external, ["EH38E1"], "grch38", fields=["display_name"], cache_dir=None, progress=False,
+        )
+    post.return_value = response([record("EH38E1", [score])])
+    with pytest.raises(ValueError, match="measurements changed"):
+        screen.enrich_ccre_metadata(
+            meta, ["EH38E1"], "grch38", fields=["display_name"], cache_dir=None, progress=False,
+        )
+
+
+def test_enrich_mixed_new_ids_and_missing_fields(tmp_path, monkeypatch):
+    requests_seen = []
+
+    def post(self, endpoint, **kwargs):
+        ids = kwargs["json"]["variables"]["accessions"]
+        requests_seen.append(ids)
+        return response([record(id_) for id_ in ids])
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    options = dict(cache_dir=tmp_path / "cache", progress=False)
+    meta = screen.fetch_ccre_metadata(["EH38E1"], "grch38", fields=["tissue"], **options)
+    enriched = screen.enrich_ccre_metadata(
+        meta, ["EH38E1", "EH38E2"], "grch38", fields=["tissue", "life_stage"], **options,
+    )
+    assert enriched.values.tolist() == [
+        ["EH38E1", "liver", "adult"], ["EH38E2", "liver", "adult"],
+    ]
+    assert requests_seen == [["EH38E1"], ["EH38E2"]]
+    spy = Mock()
+    monkeypatch.setattr(requests.Session, "post", spy)
+    screen.enrich_ccre_metadata(
+        enriched, ["EH38E1", "EH38E2"], "grch38", fields=["life_stage"], **options,
+    )
+    spy.assert_not_called()
+
+
+def test_enrichment_resumes_detail_batches_after_interruption(tmp_path, monkeypatch):
+    ids = ["EH38E1", "EH38E2"]
+    compact = record("EH38E1")["zscores"][0]
+    compact[4:8] = [None] * 4
+    post = Mock(return_value=response([record(id_, [compact]) for id_ in ids]))
+    monkeypatch.setattr(requests.Session, "post", post)
+    options = dict(cache_dir=tmp_path, progress=False, retries=0)
+    meta = screen.fetch_ccre_metadata(ids, "grch38", fields=["assay", "zscore"], **options)
+    post.side_effect = [response([record("EH38E1")]), requests.Timeout("interrupted")]
+    with pytest.raises(requests.Timeout):
+        screen.enrich_ccre_metadata(meta, ids, "grch38", fields=["tissue"], batch_size=1, **options)
+    assert "tissue" not in meta.columns
+    post.reset_mock(side_effect=True)
+    post.return_value = response([record("EH38E2")])
+    enriched = screen.enrich_ccre_metadata(meta, ids, "grch38", fields=["tissue"], batch_size=1, **options)
+    assert enriched["tissue"].tolist() == ["liver", "liver"]
+    assert post.call_count == 1
+    assert post.call_args.kwargs["json"]["variables"]["accessions"] == ["EH38E2"]
+
+
+def test_enrich_rejects_new_measurements_for_previously_empty_ccre(tmp_path, monkeypatch):
+    post = Mock(return_value=response([record("EH38E1", [])]))
+    monkeypatch.setattr(requests.Session, "post", post)
+    options = dict(cache_dir=None, progress=False)
+    meta = screen.fetch_ccre_metadata(
+        ["EH38E1"], "grch38", fields=["tissue", "zscore"], **options,
+    )
+    path = tmp_path / "empty.parquet"
+    meta.to_parquet(path, index=False)
+    post.return_value = response([record("EH38E1")])
+    with pytest.raises(ValueError, match="measurements changed"):
+        screen.enrich_ccre_metadata(
+            pd.read_parquet(path), ["EH38E1"], "grch38", fields=["life_stage"], **options,
+        )
+
+
+def test_enrich_preserves_existing_numeric_dtype(monkeypatch):
+    score = record("EH38E1")["zscores"][0]
+    score[8] = 2
+    post = Mock(return_value=response([record("EH38E1", [score])]))
+    monkeypatch.setattr(requests.Session, "post", post)
+    options = dict(cache_dir=None, progress=False)
+    meta = screen.fetch_ccre_metadata(["EH38E1"], "grch38", fields=["zscore"], **options)
+    enriched = screen.enrich_ccre_metadata(meta, ["EH38E1"], "grch38", fields=["tissue"], **options)
+    pd.testing.assert_frame_equal(enriched[meta.columns], meta)
+
+
+def test_empty_enrichment_does_not_mark_new_column_as_downloaded(monkeypatch):
+    meta = parse_zscores([record("EH38E1")], fields=["tissue"])
+    options = dict(cache_dir=None, progress=False)
+    meta = screen.enrich_ccre_metadata(meta, [], "grch38", fields=["life_stage"], **options)
+    assert pd.isna(meta.loc[0, "life_stage"])
+    post = Mock(return_value=response([record("EH38E1")]))
+    monkeypatch.setattr(requests.Session, "post", post)
+    meta = screen.enrich_ccre_metadata(meta, ["EH38E1"], "grch38", fields=["life_stage"], **options)
+    assert meta["life_stage"].tolist() == ["adult"]
+    assert post.call_count == 1
 
 
 def test_empty_pairs_and_wrong_accessions(inputs, tmp_path, monkeypatch):
