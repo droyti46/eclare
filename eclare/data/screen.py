@@ -8,6 +8,7 @@ Copyright (c) 2026 Eclare contributors.
 
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -384,3 +385,416 @@ def fetch_human_mouse_metadata(
         frame.attrs["screen"]["assembly"] = assembly
         metadata.append(frame)
     return pairs, metadata[0], metadata[1]
+
+
+# ---------------------------------------------------------------------------
+# Baseline-friendly streaming tissue metadata
+# ---------------------------------------------------------------------------
+
+_TISSUE_DATASET_VERSION = 1
+_SCORE_INDEX = {
+    "experiment_accession": 0,
+    "file_accession": 1,
+    "assay": 2,
+    "biosample": 3,
+    "display_name": 4,
+    "tissue": 5,
+    "sample_type": 6,
+    "life_stage": 7,
+    "zscore": 8,
+    "tf": 9,
+}
+
+
+def _raw_checkpoint_path(batch, assembly, query, endpoint, raw_cache_dir):
+    """Return the legacy raw-JSON checkpoint path for one exact batch."""
+    if raw_cache_dir is None:
+        return None
+    fingerprint = json.dumps([endpoint, query, assembly, batch]).encode()
+    return Path(raw_cache_dir) / assembly / (hashlib.sha256(fingerprint).hexdigest() + ".json")
+
+
+def _load_raw_checkpoint(path, *, batch, assembly, query, endpoint):
+    """Load one exact legacy checkpoint without scanning/loading the whole cache."""
+    if path is None or not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        saved = json.load(handle)
+    if isinstance(saved, list):
+        records, saved_query = saved, QUERY
+    else:
+        if saved.get("endpoint") != endpoint or saved.get("assembly") != assembly:
+            return None
+        records, saved_query = saved.get("records"), saved.get("query")
+    if saved_query != query or not isinstance(records, list):
+        return None
+    returned = [record.get("accession") for record in records]
+    if len(returned) != len(batch) or set(returned) != set(batch):
+        return None
+    return records
+
+
+def _request_ccre_batch(
+    session, batch, assembly, *, query, endpoint, timeout, retries, backoff,
+):
+    """Fetch a single SCREEN batch with the retry policy used by fetch_ccres."""
+    for attempt in range(retries + 1):
+        response = None
+        try:
+            response = session.post(
+                endpoint,
+                json={"query": query, "variables": {
+                    "assembly": assembly, "accessions": batch,
+                }},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+            requests.HTTPError,
+            requests.exceptions.ChunkedEncodingError,
+        ) as error:
+            if isinstance(error, requests.HTTPError):
+                status = response.status_code
+                if status in {401, 403}:
+                    raise RuntimeError(
+                        f"SCREEN HTTP {status}: set SCREEN_API_KEY or pass api_key; "
+                        "see https://console.wenglab.org/docs/getting-started/auth"
+                    ) from error
+                if status not in {408, 429} and status < 500:
+                    raise
+            if attempt == retries:
+                raise
+            delay = backoff * 2 ** attempt
+            if response is not None:
+                retry_after = response.headers.get("Retry-After", "")
+                if retry_after.isdigit():
+                    delay = max(delay, int(retry_after))
+            time.sleep(delay)
+            continue
+
+        payload = response.json()
+        if payload.get("errors"):
+            raise RuntimeError(f"SCREEN GraphQL errors: {payload['errors']}")
+        records = (payload.get("data") or {}).get("getcCREZScoresQuery")
+        if not isinstance(records, list):
+            raise RuntimeError(f"SCREEN {assembly}: expected a list of cCRE records")
+        returned = [record.get("accession") for record in records]
+        if len(returned) != len(batch) or set(returned) != set(batch):
+            missing = sorted(set(batch) - set(returned))
+            unexpected = sorted(set(returned) - set(batch))
+            raise RuntimeError(
+                f"SCREEN {assembly}: incomplete/duplicate response; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        return records
+    raise AssertionError("unreachable")
+
+
+def project_tissue_zscores(ccres, *, assays=None):
+    """Project raw SCREEN measurements to cCRE/tissue/assay/zscore rows.
+
+    No aggregation is performed: every SCREEN measurement with a tissue label
+    is retained as its own row.  The heavier biosample/sample-type/life-stage
+    fields are deliberately omitted from this baseline layer, so replicate
+    measurements may have identical ``ccre_id``, ``tissue`` and ``assay`` keys.
+
+    ``assays`` can optionally restrict the retained assay names.  Missing tissue
+    labels and missing/non-finite z-scores are skipped.  The returned z-score is
+    stored as float32 and the DataFrame has no SCREEN attrs/row-key payload.
+    """
+    if assays is None:
+        allowed_assays = None
+    elif isinstance(assays, str):
+        allowed_assays = {assays}
+    else:
+        allowed_assays = set(assays)
+
+    rows = []
+    for ccre in ccres:
+        accession = ccre["accession"]
+        for score in ccre.get("zscores") or []:
+            if not isinstance(score, (list, tuple)) or len(score) not in {9, 10}:
+                raise ValueError(f"{accession}: expected 9 or 10 Z-score fields")
+
+            assay = score[_SCORE_INDEX["assay"]]
+            tissue = score[_SCORE_INDEX["tissue"]]
+            raw_zscore = score[_SCORE_INDEX["zscore"]]
+
+            if allowed_assays is not None and assay not in allowed_assays:
+                continue
+            if tissue is None or tissue == "":
+                continue
+            if raw_zscore is None or raw_zscore == "":
+                continue
+
+            try:
+                zscore = float(raw_zscore)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{accession}: non-numeric zscore {raw_zscore!r}"
+                ) from error
+            if not math.isfinite(zscore):
+                continue
+
+            rows.append((accession, tissue, assay, zscore))
+
+    frame = pd.DataFrame.from_records(
+        rows, columns=["ccre_id", "tissue", "assay", "zscore"],
+    )
+    if frame.empty:
+        return pd.DataFrame({
+            "ccre_id": pd.Series(dtype="string"),
+            "tissue": pd.Series(dtype="string"),
+            "assay": pd.Series(dtype="string"),
+            "zscore": pd.Series(dtype="float32"),
+        })
+    frame["zscore"] = frame["zscore"].astype("float32")
+    return frame
+
+def _tissue_dataset_dir(
+    output_dir, accessions, assembly, *, batch_size, preview_size, assays,
+):
+    accessions_sha256 = hashlib.sha256("\n".join(accessions).encode()).hexdigest()
+    config = {
+        "version": _TISSUE_DATASET_VERSION,
+        "assembly": assembly,
+        "n_accessions": len(accessions),
+        "accessions_sha256": accessions_sha256,
+        "batch_size": batch_size,
+        "preview_size": preview_size,
+        "assays": (
+            None if assays is None
+            else [assays] if isinstance(assays, str)
+            else sorted(set(assays))
+        ),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+    return Path(output_dir) / f"{assembly}-{fingerprint}", config
+
+
+def _write_json_atomic(path, payload):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def fetch_ccre_tissue_metadata(
+    accessions,
+    assembly,
+    output_dir=".screen_tissue",
+    batch_size=200,
+    *,
+    assays=None,
+    preview_size=3,
+    timeout=60,
+    retries=3,
+    backoff=1.0,
+    raw_cache_dir=".screen_cache",
+    progress=True,
+    endpoint=SCREEN_ENDPOINT,
+    api_key=None,
+    delete_reused_raw=False,
+):
+    """Stream compact cCRE × tissue × assay metadata to a Parquet dataset.
+
+    Unlike :func:`fetch_ccres`, this function never accumulates all raw SCREEN
+    responses in RAM and never writes newly downloaded 100+ MB raw JSON batches.
+    Each batch is projected immediately to ``ccre_id``, ``tissue``, ``assay``
+    and ``zscore`` without aggregation, then checkpointed as a Parquet shard.
+    Re-running the function resumes from those shards.
+
+    Existing legacy ``.screen_cache`` JSON files are reused *one batch at a
+    time* when their exact hashes match. Set ``delete_reused_raw=True`` only if
+    you deliberately want to reclaim those raw-cache files after a compact shard
+    has been safely written.
+
+    The return value is the directory of the Parquet dataset. Reading the whole
+    dataset with pandas is optional; for large runs prefer ``pyarrow.dataset``.
+    """
+    accessions, assembly = _accessions(accessions, assembly)
+    if batch_size < 1 or timeout <= 0 or retries < 0 or backoff < 0:
+        raise ValueError("batch_size/timeout must be positive; retries/backoff nonnegative")
+    if preview_size < 0:
+        raise ValueError("preview_size must be nonnegative")
+    # Tissue is score[5], therefore biosample details must be requested.
+    query = QUERY
+    dataset_dir, config = _tissue_dataset_dir(
+        output_dir,
+        accessions,
+        assembly,
+        batch_size=batch_size,
+        preview_size=preview_size,
+        assays=assays,
+    )
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = dataset_dir / "_manifest.json"
+    if manifest_path.exists():
+        current = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if current.get("config") != config:
+            raise RuntimeError(f"Incompatible existing dataset manifest: {manifest_path}")
+    else:
+        _write_json_atomic(manifest_path, {
+            "config": config,
+            "columns": ["ccre_id", "tissue", "assay", "zscore"],
+            "rows": 0,
+            "completed_batches": 0,
+        })
+
+    # Preserve the old 3-ID preview + remaining batches layout so an interrupted
+    # run can reuse the raw JSON cache already downloaded by the previous code.
+    batches = []
+    preview_size = min(preview_size, len(accessions))
+    if preview_size:
+        batches.append(accessions[:preview_size])
+    remaining = accessions[preview_size:]
+    batches.extend(
+        remaining[start:start + batch_size]
+        for start in range(0, len(remaining), batch_size)
+    )
+
+    api_key = api_key or os.environ.get("SCREEN_API_KEY")
+    total_rows = 0
+    completed_batches = 0
+
+    with requests.Session() as session, tqdm(
+        total=len(accessions), desc=f"SCREEN tissue {assembly}", unit="cCRE",
+        disable=not progress,
+    ) as bar:
+        if api_key:
+            session.headers["Authorization"] = f"Bearer {api_key}"
+
+        for batch_index, batch in enumerate(batches):
+            part = dataset_dir / f"part-{batch_index:05d}.parquet"
+            if part.exists():
+                # Parquet footer gives row count without materialising the shard.
+                try:
+                    import pyarrow.parquet as pq
+                    total_rows += pq.ParquetFile(part).metadata.num_rows
+                except ImportError:
+                    total_rows += len(pd.read_parquet(part, columns=["ccre_id"]))
+                completed_batches += 1
+                bar.update(len(batch))
+                continue
+
+            raw_path = _raw_checkpoint_path(
+                batch, assembly, query, endpoint, raw_cache_dir,
+            )
+            records = _load_raw_checkpoint(
+                raw_path, batch=batch, assembly=assembly, query=query, endpoint=endpoint,
+            )
+            reused_raw = records is not None
+            if records is None:
+                records = _request_ccre_batch(
+                    session,
+                    batch,
+                    assembly,
+                    query=query,
+                    endpoint=endpoint,
+                    timeout=timeout,
+                    retries=retries,
+                    backoff=backoff,
+                )
+
+            compact = project_tissue_zscores(records, assays=assays)
+            temporary = part.with_suffix(".parquet.tmp")
+            compact.to_parquet(temporary, index=False, compression="zstd")
+            temporary.replace(part)
+            total_rows += len(compact)
+            completed_batches += 1
+
+            # Drop the huge raw response before the next request.
+            del compact
+            del records
+
+            if reused_raw and delete_reused_raw and raw_path is not None:
+                raw_path.unlink(missing_ok=True)
+
+            _write_json_atomic(manifest_path, {
+                "config": config,
+                "columns": ["ccre_id", "tissue", "assay", "zscore"],
+                "rows": total_rows,
+                "completed_batches": completed_batches,
+            })
+            bar.update(len(batch))
+
+    _write_json_atomic(manifest_path, {
+        "config": config,
+        "columns": ["ccre_id", "tissue", "assay", "zscore"],
+        "rows": total_rows,
+        "completed_batches": completed_batches,
+    })
+    return dataset_dir
+
+
+def fetch_human_mouse_tissue_metadata(
+    homologs_path,
+    human_els_path,
+    mouse_els_path,
+    output_dir=".screen_tissue",
+    batch_size=200,
+    *,
+    assays=None,
+    max_pairs=None,
+    max_human_ids=None,
+    random_state=42,
+    preview_size=3,
+    timeout=60,
+    retries=3,
+    backoff=1.0,
+    raw_cache_dir=".screen_cache",
+    progress=True,
+    endpoint=SCREEN_ENDPOINT,
+    api_key=None,
+    delete_reused_raw=False,
+):
+    """Build baseline tissue metadata for homologous human/mouse ELS pairs.
+
+    For a fast baseline, ``max_pairs`` deterministically subsamples homologous
+    pair rows. ``max_human_ids`` instead keeps pairs whose human cCRE belongs to
+    the first N sorted human IDs; this is useful for warm-starting from an old
+    interrupted cache whose batches were created in sorted-ID order. The two
+    options are mutually exclusive. Set both to ``None`` for the full dataset.
+    No tissue-level aggregation is performed; every retained SCREEN measurement
+    remains a row in the Parquet shards. The returned metadata objects are
+    Parquet *dataset directories*, not giant in-memory DataFrames.
+
+    Returns ``(pairs, human_dataset_dir, mouse_dataset_dir)``.
+    """
+    pairs = load_orthologous_els(homologs_path, human_els_path, mouse_els_path)
+    if max_pairs is not None and max_human_ids is not None:
+        raise ValueError("Use either max_pairs or max_human_ids, not both")
+    if max_human_ids is not None:
+        if max_human_ids < 1:
+            raise ValueError("max_human_ids must be positive or None")
+        full_human_ids = sorted(pairs["human_id"].unique())
+        keep = set(full_human_ids[:max_human_ids])
+        pairs = pairs.loc[pairs["human_id"].isin(keep)].reset_index(drop=True)
+    elif max_pairs is not None:
+        if max_pairs < 1:
+            raise ValueError("max_pairs must be positive or None")
+        if len(pairs) > max_pairs:
+            pairs = pairs.sample(n=max_pairs, random_state=random_state).reset_index(drop=True)
+
+    human_ids = sorted(pairs["human_id"].unique())
+    mouse_ids = sorted(pairs["mouse_id"].unique())
+    common = dict(
+        output_dir=output_dir,
+        batch_size=batch_size,
+        assays=assays,
+        preview_size=preview_size,
+        timeout=timeout,
+        retries=retries,
+        backoff=backoff,
+        raw_cache_dir=raw_cache_dir,
+        progress=progress,
+        endpoint=endpoint,
+        api_key=api_key,
+        delete_reused_raw=delete_reused_raw,
+    )
+    human_dir = fetch_ccre_tissue_metadata(human_ids, "grch38", **common)
+    mouse_dir = fetch_ccre_tissue_metadata(mouse_ids, "mm10", **common)
+    return pairs, human_dir, mouse_dir
